@@ -4,9 +4,11 @@ go 1.25.5
 
 require (
 	github.com/anchore/syft v1.40.1
+	github.com/arangodb/go-driver/v2 v2.1.6
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/go-github/v69 v69.2.0
+	github.com/google/go-github/v81 v81.0.0
 	github.com/ortelius/pdvd-backend/v12 v12.0.326
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/oauth2 v0.34.0
@@ -58,7 +60,6 @@ require (
 	github.com/aquasecurity/go-npm-version v0.0.2 // indirect
 	github.com/aquasecurity/go-pep440-version v0.0.1 // indirect
 	github.com/aquasecurity/go-version v0.0.1 // indirect
-	github.com/arangodb/go-driver/v2 v2.1.6 // indirect
 	github.com/arangodb/go-velocypack v0.0.0-20200318135517-5af53c29c67e // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.1 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.4 // indirect
