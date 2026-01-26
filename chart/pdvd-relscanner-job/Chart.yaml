@@ -2,7 +2,7 @@
 apiVersion: v2
 description: Release Scanner Worker
 icon: https://ortelius.github.io/pdvd-charts/ortelius.svg
-name: pdvd-relscanner
+name: pdvd-relscanner-job
 type: application
 version: 11.0.0
 appVersion: 11.0.0

@@ -69,6 +69,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 }
 
+// Execute runs the root command
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -596,6 +597,7 @@ func downloadSBOMArtifact(ctx context.Context, client *github.Client, owner, rep
 	return nil, fmt.Errorf("no .json file found inside artifact zip")
 }
 
+// LogAnalysis contains metadata extracted from workflow logs
 type LogAnalysis struct {
 	DockerImage    string
 	ReleaseVersion string
@@ -853,7 +855,7 @@ func generateSBOMFromInput(ctx context.Context, input string) ([]byte, string, e
 	}
 
 	cfg := cyclonedxjson.DefaultEncoderConfig()
-	enc, err := cyclonedxjson.NewFormatEncoderWithConfig(cfg)
+	enc := cyclonedxjson.NewFormatEncoderWithConfig(cfg)
 	var buf bytes.Buffer
 	if err := enc.Encode(&buf, *s); err != nil {
 		return nil, "", err
