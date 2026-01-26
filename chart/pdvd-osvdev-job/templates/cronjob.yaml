@@ -1,0 +1,66 @@
+---
+# Copyright (c) 2021 Linux Foundation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "microservice.name" . }}
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/os: linux
+          containers:
+          - name: {{ include "microservice.name" . }}
+            image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: API_BASE_URL
+                value: {{ .Values.env.apiBaseUrl | quote }}
+              # Source GitHub creds from 'github-creds' secret
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-creds  # Matches secret.yaml metadata.name
+                    key: AppId          # Matches secret.yaml data.AppId
+              - name: GITHUB_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-creds  # Matches secret.yaml metadata.name
+                    key: PrivateKey     # Matches secret.yaml data.PrivateKey
+              - name: ARANGO_USER
+                valueFrom:
+                  secretKeyRef:
+                    name: arangodb
+                    key: DBUserName
+              - name: ARANGO_PASS
+                valueFrom:
+                  secretKeyRef:
+                    name: arangodb
+                    key: DBPassword
+              - name: ARANGO_HOST
+                valueFrom:
+                  secretKeyRef:
+                    name: arangodb
+                    key: DBHost
+              - name: ARANGO_PORT
+                valueFrom:
+                  secretKeyRef:
+                    name: arangodb
+                    key: DBPort
+          restartPolicy: OnFailure
