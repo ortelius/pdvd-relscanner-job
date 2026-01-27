@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -26,6 +27,10 @@ import (
 	"github.com/anchore/syft/syft/format/cyclonedxjson"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-github/v69/github"
+
+	// OCI and Container Registry logic
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	// ArangoDB v2 Driver
 	"github.com/arangodb/go-driver/v2/arangodb"
@@ -50,6 +55,21 @@ var (
 	envAppID      = os.Getenv("GITHUB_APP_ID")
 	envPrivateKey = os.Getenv("GITHUB_PRIVATE_KEY")
 )
+
+// -------------------- NEW DATA STRUCTURES --------------------
+
+// GitDetails represents metadata extracted from OCI image labels
+type GitDetails struct {
+	Authors  string `json:"authors,omitempty"`
+	Licenses string `json:"licenses,omitempty"`
+	RefName  string `json:"ref_name,omitempty"`
+	Revision string `json:"revision,omitempty"`
+	Source   string `json:"source,omitempty"`
+	Title    string `json:"title,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Version  string `json:"version,omitempty"`
+}
 
 // -------------------- CLI COMMANDS --------------------
 
@@ -79,19 +99,15 @@ func Execute() {
 
 // -------------------- STATE MANAGEMENT --------------------
 
-// ScannerState represents the persisted JSON record in the metadata collection
 type ScannerState struct {
 	Key            string           `json:"_key,omitempty"`
 	ProcessedRepos map[string]int64 `json:"processed_repos"`
 }
 
 func loadScannerState(ctx context.Context, dbConn *database.DBConnection) (map[string]int64, error) {
-	// Try to fetch the state document
 	query := `RETURN DOCUMENT("metadata/relscanner_state")`
-	// V2 Driver accepts nil for options if none are needed
 	cursor, err := dbConn.Database.Query(ctx, query, nil)
 	if err != nil {
-		// If collection doesn't exist or query fails, just return empty map (first run)
 		log.Printf("      ⚠️  Could not load state (first run?): %v", err)
 		return make(map[string]int64), nil
 	}
@@ -100,7 +116,6 @@ func loadScannerState(ctx context.Context, dbConn *database.DBConnection) (map[s
 	if cursor.HasMore() {
 		var state ScannerState
 		if _, err := cursor.ReadDocument(ctx, &state); err != nil {
-			// If document is null (not found), ReadDocument returns error or we handle nil
 			return make(map[string]int64), nil
 		}
 		if state.ProcessedRepos == nil {
@@ -108,64 +123,33 @@ func loadScannerState(ctx context.Context, dbConn *database.DBConnection) (map[s
 		}
 		return state.ProcessedRepos, nil
 	}
-
 	return make(map[string]int64), nil
 }
 
 func saveScannerState(ctx context.Context, dbConn *database.DBConnection, repos map[string]int64) error {
-	// Upsert the state document
 	query := `
 		UPSERT { _key: "relscanner_state" }
 		INSERT { _key: "relscanner_state", processed_repos: @repos }
 		UPDATE { processed_repos: @repos }
 		IN metadata
 	`
-	bindVars := map[string]interface{}{
-		"repos": repos,
-	}
-
-	// Use &arangodb.QueryOptions to wrap bindVars for v2 driver
-	_, err := dbConn.Database.Query(ctx, query, &arangodb.QueryOptions{
-		BindVars: bindVars,
-	})
+	bindVars := map[string]interface{}{"repos": repos}
+	_, err := dbConn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
 	return err
 }
 
 // -------------------- WORKER LOGIC --------------------
 
 func runScanner(_ *cobra.Command, _ []string) error {
-	// 1. Configure Server URL
 	serverURL = os.Getenv("API_BASE_URL")
 	if serverURL == "" {
 		serverURL = "http://localhost:3000"
 	}
-	if verbose {
-		log.Printf("Using API Server: %s", serverURL)
+
+	if envAppID == "" || envPrivateKey == "" {
+		return fmt.Errorf("missing GITHUB_APP_ID or GITHUB_PRIVATE_KEY")
 	}
 
-	// 2. Validate Required Environment Variables
-	var missingVars []string
-
-	if envAppID == "" {
-		missingVars = append(missingVars, "GITHUB_APP_ID")
-	}
-	if envPrivateKey == "" {
-		missingVars = append(missingVars, "GITHUB_PRIVATE_KEY")
-	}
-
-	if len(missingVars) > 0 {
-		return fmt.Errorf("missing required environment variables: %s", strings.Join(missingVars, ", "))
-	}
-
-	// 3. Set Default DB Credentials for Local Dev (if missing)
-	if _, ok := os.LookupEnv("ARANGO_USER"); !ok {
-		os.Setenv("ARANGO_USER", "")
-	}
-	if _, ok := os.LookupEnv("ARANGO_PASS"); !ok {
-		os.Setenv("ARANGO_PASS", "")
-	}
-
-	// 4. Connect to ArangoDB
 	log.Println("Connecting to ArangoDB...")
 	dbConn := database.InitializeDatabase()
 	if dbConn.Database == nil {
@@ -173,18 +157,10 @@ func runScanner(_ *cobra.Command, _ []string) error {
 	}
 
 	ctx := context.Background()
-
-	// 5. Load State
-	log.Println("📥 Loading scanner state from metadata collection...")
 	processedRepos, err := loadScannerState(ctx, &dbConn)
 	if err != nil {
-		log.Printf("⚠️  Error loading state: %v. Starting fresh.", err)
 		processedRepos = make(map[string]int64)
 	}
-	log.Printf("   Loaded state for %d repositories.", len(processedRepos))
-
-	// 6. Find Users with GitHub Installations
-	log.Println("🔍 Scanning for users with GitHub connections...")
 
 	query := `
 		FOR u IN users
@@ -197,37 +173,21 @@ func runScanner(_ *cobra.Command, _ []string) error {
 	}
 	defer cursor.Close()
 
-	userCount := 0
 	for cursor.HasMore() {
 		var user model.User
-		if _, err := cursor.ReadDocument(ctx, &user); err != nil {
-			log.Printf("⚠️  Error reading user document: %v", err)
-			continue
-		}
-		userCount++
-
-		log.Printf("👤 Processing user: %s (Install ID: %s)", user.Username, user.GitHubInstallationID)
-		if err := processUserInstallation(ctx, user.GitHubInstallationID, user.Username, processedRepos); err != nil {
-			log.Printf("❌ Failed to process user %s: %v", user.Username, err)
+		if _, err := cursor.ReadDocument(ctx, &user); err == nil {
+			processUserInstallation(ctx, user.GitHubInstallationID, user.Username, processedRepos)
 		}
 	}
 
-	// 7. Save State
-	log.Println("💾 Saving scanner state...")
-	if err := saveScannerState(ctx, &dbConn, processedRepos); err != nil {
-		log.Printf("❌ Failed to save state: %v", err)
-	} else {
-		log.Println("✅ State saved successfully.")
-	}
-
-	log.Printf("✅ Scan complete. Processed %d users.", userCount)
+	saveScannerState(ctx, &dbConn, processedRepos)
 	return nil
 }
 
-func processUserInstallation(ctx context.Context, installationID, username string, processedRepos map[string]int64) error {
+func processUserInstallation(ctx context.Context, installationID, _ string, processedRepos map[string]int64) error {
 	token, err := getInstallationToken(envAppID, envPrivateKey, installationID)
 	if err != nil {
-		return fmt.Errorf("authentication failed: %w", err)
+		return err
 	}
 
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
@@ -235,109 +195,88 @@ func processUserInstallation(ctx context.Context, installationID, username strin
 	client := github.NewClient(tc)
 
 	opt := &github.ListOptions{PerPage: 100}
-	var allRepos []*github.Repository
-
 	for {
 		repos, resp, err := client.Apps.ListRepos(ctx, opt)
 		if err != nil {
-			return fmt.Errorf("failed to list repos: %w", err)
+			break
 		}
-		allRepos = append(allRepos, repos.Repositories...)
+		for _, repo := range repos.Repositories {
+			if !repo.GetArchived() {
+				processSingleRepo(ctx, client, token, repo.GetOwner().GetLogin(), repo.GetName(), processedRepos)
+			}
+		}
 		if resp.NextPage == 0 {
 			break
 		}
 		opt.Page = resp.NextPage
 	}
-
-	log.Printf("   Found %d accessible repositories for %s", len(allRepos), username)
-
-	for _, repo := range allRepos {
-		if repo.GetArchived() {
-			continue
-		}
-
-		owner := repo.GetOwner().GetLogin()
-		repoName := repo.GetName()
-
-		log.Printf("   👉 Scanning Repo: %s/%s", owner, repoName)
-
-		if err := processSingleRepo(ctx, client, token, owner, repoName, processedRepos); err != nil {
-			log.Printf("      ⚠️  Skipping %s/%s: %v", owner, repoName, err)
-		}
-	}
 	return nil
 }
 
 func processSingleRepo(ctx context.Context, client *github.Client, token, owner, repoName string, processedRepos map[string]int64) error {
-	// A. Find Latest Relevant Run
 	runID, commitSHA, branchName, analysis, err := findLatestRelevantRun(ctx, client, owner, repoName)
 	if err != nil {
 		return err
 	}
 
-	// --- STATE CHECK ---
 	repoKey := fmt.Sprintf("%s/%s", owner, repoName)
-	lastProcessedID, exists := processedRepos[repoKey]
-
-	if exists && runID <= lastProcessedID {
-		log.Printf("      ⏭️  Skipping Run ID %d: Already processed (Last: %d)", runID, lastProcessedID)
+	if lastID, exists := processedRepos[repoKey]; exists && runID <= lastID {
 		return nil
 	}
 
-	log.Printf("      ✅ Found new relevant run: ID %d (Ver: %s, Img: %s)",
-		runID, analysis.ReleaseVersion, analysis.DockerImage)
+	// 1. EXTRACT OCI LABELS (Refined Git Info from Image)
+	var gitDetails *GitDetails
+	if analysis.DockerImage != "" {
+		gitDetails, _ = extractImageLabels(analysis.DockerImage)
+	}
 
-	// B. Determine Basic Version
+	// Determine Version
 	releaseVersion := "0.0.0-snapshot"
 	if analysis.DockerImage != "" {
 		parts := strings.Split(analysis.DockerImage, ":")
 		if len(parts) > 1 {
 			releaseVersion = parts[len(parts)-1]
 		}
-		log.Printf("      [Priority] Using Docker Tag from Manifest List: %s", releaseVersion)
 	} else if analysis.ReleaseVersion != "" {
 		releaseVersion = analysis.ReleaseVersion
 	}
 
-	// C. Clone & Extract Git Metadata
-	log.Printf("      Cloning repo at %s to extract git metadata...", commitSHA)
-	tempDir, err := os.MkdirTemp("", "relscanner-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
-	}
-
-	// --- UPDATED CLEANUP LOGIC ---
-	// Defer cleanup of the specific git clone directory AND any stereoscope temps
+	// 2. CLONE & DERIVE MAPPING
+	tempDir, _ := os.MkdirTemp("", "relscanner-*")
 	defer func() {
-		if verbose {
-			log.Printf("      Cleaning up temp directory: %s", tempDir)
-		}
 		os.RemoveAll(tempDir)
 		cleanStereoscopeTemps()
 	}()
 
 	cloneURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, owner, repoName)
 	if err := gitCloneCheckout(cloneURL, commitSHA, tempDir); err != nil {
-		return fmt.Errorf("failed to clone and checkout: %w", err)
+		return err
 	}
 
 	originalWd, _ := os.Getwd()
-	if err := os.Chdir(tempDir); err != nil {
-		return fmt.Errorf("failed to chdir to temp repo: %w", err)
-	}
-
-	defer func() {
-		_ = os.Chdir(originalWd)
-	}()
+	os.Chdir(tempDir)
+	defer os.Chdir(originalWd)
 
 	mapping := util.GetDerivedEnvMapping(make(map[string]string))
-
 	mapping["CompName"] = fmt.Sprintf("%s/%s", owner, repoName)
 	mapping["GitRepoProject"] = repoName
 	mapping["GitOrg"] = owner
 	mapping["GitCommit"] = commitSHA
 	mapping["GitBranch"] = branchName
 	mapping["BuildId"] = fmt.Sprintf("%d", runID)
+
+	// Apply priorities from OCI labels if found
+	if gitDetails != nil {
+		if gitDetails.URL != "" {
+			mapping["GitUrl"] = gitDetails.URL
+		}
+		if gitDetails.Revision != "" {
+			mapping["GitCommit"] = gitDetails.Revision
+		}
+		if gitDetails.Authors != "" {
+			mapping["GitCommitAuthors"] = gitDetails.Authors
+		}
+	}
 
 	if analysis.DockerImage != "" {
 		mapping["DockerRepo"] = analysis.DockerImage
@@ -351,132 +290,207 @@ func processSingleRepo(ctx context.Context, client *github.Client, token, owner,
 	release := buildRelease(mapping, mapping["ProjectType"])
 	populateContentSha(release)
 
-	if release.GitURL == "" {
-		release.GitURL = fmt.Sprintf("https://github.com/%s/%s", owner, repoName)
-	}
-	if verbose {
-		fmt.Printf("      Fetching OpenSSF Scorecard for %s @ %s...\n", release.GitURL, release.GitCommit)
-	}
-	scorecardResult, aggregateScore, err := fetchOpenSSFScorecard(release.GitURL, release.GitCommit)
-	if err == nil {
-		release.ScorecardResult = scorecardResult
-		release.OpenSSFScorecardScore = aggregateScore
-		if verbose {
-			fmt.Printf("      OpenSSF Score: %.2f/10\n", aggregateScore)
-		}
-	} else if verbose {
-		log.Printf("      Warning: Scorecard fetch failed: %v", err)
-	}
-
-	// D. SBOM Acquisition
+	// 3. SBOM ACQUISITION (OCI Attestation Priority)
 	var sbomBytes []byte
 	var dockerSHA string
 
-	if analysis.HasSBOM {
-		log.Println("      ⬇️  Downloading existing SBOM artifact from GitHub...")
-		downloaded, err := downloadSBOMArtifact(ctx, client, owner, repoName, runID)
-		if err == nil && len(downloaded) > 0 {
-			sbomBytes = downloaded
-			log.Printf("      ✅ Successfully downloaded SBOM (%d bytes)", len(sbomBytes))
-		} else {
-			log.Printf("      ⚠️  Failed to download SBOM artifact: %v (falling back to generation)", err)
+	if analysis.DockerImage != "" {
+		log.Printf("      🔍 Checking OCI Referrers for SBOM: %s", analysis.DockerImage)
+		extractedSbom, err := extractSBOMFromImage(analysis.DockerImage)
+		if err == nil {
+			sbomBytes = extractedSbom
+			log.Printf("      ✅ Extracted SBOM from OCI Attestation")
 		}
 	}
 
-	if len(sbomBytes) == 0 {
-		if analysis.DockerImage != "" {
-			if verbose {
-				log.Printf("      Generating SBOM from registry image: %s...", analysis.DockerImage)
-			}
-			sbomBytes, dockerSHA, err = generateSBOMFromInput(ctx, analysis.DockerImage)
-			if err != nil {
-				return fmt.Errorf("failed to generate SBOM from image: %w", err)
-			}
-			if verbose && dockerSHA != "" {
-				log.Printf("      Extracted Docker SHA: %s", dockerSHA)
-			}
-		} else {
-			log.Println("      ⚠️  No SBOM artifact and no Docker image found. Skipping SBOM generation.")
-			return nil
+	if len(sbomBytes) == 0 && analysis.HasSBOM {
+		downloaded, err := downloadSBOMArtifact(ctx, client, owner, repoName, runID)
+		if err == nil {
+			sbomBytes = downloaded
 		}
+	}
+
+	if len(sbomBytes) == 0 && analysis.DockerImage != "" {
+		sbomBytes, dockerSHA, _ = generateSBOMFromInput(ctx, analysis.DockerImage)
 	}
 
 	if dockerSHA != "" {
 		release.DockerSha = dockerSHA
 		release.ContentSha = dockerSHA
-	} else if release.ContentSha == "" {
-		release.ContentSha = commitSHA
+	}
+
+	// 4. SCORECARD & UPLOAD
+	scorecardResult, aggregateScore, err := fetchOpenSSFScorecard(release.GitURL, release.GitCommit)
+	if err == nil {
+		release.ScorecardResult = scorecardResult
+		release.OpenSSFScorecardScore = aggregateScore
 	}
 
 	sbomObj := model.NewSBOM()
 	sbomObj.Content = json.RawMessage(sbomBytes)
+	req := model.ReleaseWithSBOM{ProjectRelease: *release, SBOM: *sbomObj}
 
-	req := model.ReleaseWithSBOM{
-		ProjectRelease: *release,
-		SBOM:           *sbomObj,
+	if err := postRelease(serverURL, req); err == nil {
+		processedRepos[repoKey] = runID
+		log.Printf("      🚀 Release %s synced (SHA: %s)", releaseVersion, release.ContentSha)
 	}
-
-	if err := postRelease(serverURL, req); err != nil {
-		return fmt.Errorf("API upload failed: %w", err)
-	}
-	log.Printf("      🚀 Release %s synced successfully (SHA: %s)", releaseVersion, release.ContentSha)
-
-	// --- UPDATE STATE IN MEMORY ---
-	processedRepos[repoKey] = runID
 
 	return nil
 }
 
-// -------------------- CLEANUP UTILS --------------------
+// -------------------- NEW OCI & SBOM LOGIC --------------------
 
-// cleanStereoscopeTemps finds and removes all /tmp/stereoscope* directories
-func cleanStereoscopeTemps() {
-	files, err := filepath.Glob("/tmp/stereoscope*")
+func extractImageLabels(imageRef string) (*GitDetails, error) {
+	ref, err := name.ParseReference(imageRef)
 	if err != nil {
-		log.Printf("      ⚠️  Failed to glob stereoscope temps: %v", err)
-		return
+		return nil, err
 	}
-	for _, f := range files {
-		if verbose {
-			log.Printf("      Cleaning up stereoscope temp: %s", f)
-		}
-		if err := os.RemoveAll(f); err != nil {
-			log.Printf("      ⚠️  Failed to remove stereoscope temp %s: %v", f, err)
-		}
+	desc, err := remote.Get(ref)
+	if err != nil {
+		return nil, err
 	}
+	img, err := desc.Image()
+	if err != nil {
+		return nil, err
+	}
+	configFile, err := img.ConfigFile()
+	if err != nil {
+		return nil, err
+	}
+
+	labels := configFile.Config.Labels
+	return &GitDetails{
+		Authors:  labels["org.opencontainers.image.authors"],
+		Licenses: labels["org.opencontainers.image.licenses"],
+		Revision: labels["org.opencontainers.image.revision"],
+		Source:   labels["org.opencontainers.image.source"],
+		URL:      labels["org.opencontainers.image.url"],
+		Version:  labels["org.opencontainers.image.version"],
+	}, nil
 }
 
-// -------------------- AUTO-DISCOVERY --------------------
+func extractSBOMFromImage(imageRef string) ([]byte, error) {
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		return nil, err
+	}
+
+	// Try OCI Referrers API first
+	if sbom, err := extractSBOMFromOCIReferrers(ref); err == nil {
+		return sbom, nil
+	}
+
+	// Resolve to digest for attachment/attestation lookup
+	desc, err := remote.Get(ref)
+	if err != nil {
+		return nil, err
+	}
+	leafRef, _ := name.ParseReference(fmt.Sprintf("%s@%s", ref.Context().Name(), desc.Digest.String()))
+
+	if sbom, err := extractSBOMFromCosignAttestation(leafRef); err == nil {
+		return sbom, nil
+	}
+	return nil, fmt.Errorf("no OCI SBOM found")
+}
+
+func extractSBOMFromOCIReferrers(ref name.Reference) ([]byte, error) {
+	desc, err := remote.Get(ref)
+	if err != nil {
+		return nil, err
+	}
+	idx, err := remote.Referrers(ref.Context().Digest(desc.Digest.String()))
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := idx.IndexManifest()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, m := range manifest.Manifests {
+		aType := strings.ToLower(m.ArtifactType)
+		if aType == "" {
+			aType = strings.ToLower(string(m.MediaType))
+		}
+		if strings.Contains(aType, "sbom") || strings.Contains(aType, "cyclonedx") {
+			rDigest, _ := name.NewDigest(fmt.Sprintf("%s@%s", ref.Context().Name(), m.Digest.String()))
+			img, err := remote.Image(rDigest)
+			if err != nil {
+				continue
+			}
+			layers, _ := img.Layers()
+			if len(layers) > 0 {
+				rc, _ := layers[0].Uncompressed()
+				defer rc.Close()
+				return io.ReadAll(rc)
+			}
+		}
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+func extractSBOMFromCosignAttestation(ref name.Reference) ([]byte, error) {
+	desc, err := remote.Get(ref)
+	if err != nil {
+		return nil, err
+	}
+	idx, err := remote.Referrers(ref.Context().Digest(desc.Digest.String()))
+	if err != nil {
+		return nil, err
+	}
+	manifest, _ := idx.IndexManifest()
+
+	for _, m := range manifest.Manifests {
+		if !strings.Contains(string(m.MediaType), "dsse") {
+			continue
+		}
+		rDigest, _ := name.NewDigest(fmt.Sprintf("%s@%s", ref.Context().Name(), m.Digest.String()))
+		img, _ := remote.Image(rDigest)
+		layers, _ := img.Layers()
+		if len(layers) > 0 {
+			rc, _ := layers[0].Uncompressed()
+			content, _ := io.ReadAll(rc)
+			rc.Close()
+
+			var env struct {
+				Payload string `json:"payload"`
+			}
+			if err := json.Unmarshal(content, &env); err == nil {
+				data, _ := base64.StdEncoding.DecodeString(env.Payload)
+				var statement map[string]interface{}
+				if err := json.Unmarshal(data, &statement); err == nil {
+					if pred, ok := statement["predicate"]; ok {
+						return json.Marshal(pred)
+					}
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+// -------------------- EXISTING HELPERS --------------------
+
+func cleanStereoscopeTemps() {
+	files, _ := filepath.Glob("/tmp/stereoscope*")
+	for _, f := range files {
+		os.RemoveAll(f)
+	}
+}
 
 func findLatestRelevantRun(ctx context.Context, client *github.Client, owner, repo string) (int64, string, string, *LogAnalysis, error) {
 	var allRuns []*github.WorkflowRun
 	seenRunIDs := make(map[int64]bool)
-
 	targetBranches := []string{"main", "master"}
 	targetEvents := []string{"push", "workflow_dispatch", "release"}
 
 	for _, branch := range targetBranches {
 		for _, event := range targetEvents {
 			opts := &github.ListWorkflowRunsOptions{
-				Status:      "success",
-				Branch:      branch,
-				Event:       event,
-				ListOptions: github.ListOptions{PerPage: 100},
+				Status: "success", Branch: branch, Event: event, ListOptions: github.ListOptions{PerPage: 100},
 			}
-
 			runs, _, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, opts)
-			if err != nil {
-				if verbose {
-					log.Printf("      [DEBUG] Failed to fetch runs for branch '%s' event '%s': %v", branch, event, err)
-				}
-				continue
-			}
-			if runs.TotalCount != nil && *runs.TotalCount > 0 {
-				if verbose {
-					log.Printf("      [DEBUG] Found %d runs for branch '%s' event '%s'",
-						*runs.TotalCount, branch, event)
-				}
-
+			if err == nil && runs.TotalCount != nil && *runs.TotalCount > 0 {
 				for _, r := range runs.WorkflowRuns {
 					if !seenRunIDs[r.GetID()] {
 						seenRunIDs[r.GetID()] = true
@@ -488,42 +502,18 @@ func findLatestRelevantRun(ctx context.Context, client *github.Client, owner, re
 	}
 
 	if len(allRuns) == 0 {
-		return 0, "", "", nil, fmt.Errorf("no successful runs found on main/master")
+		return 0, "", "", nil, fmt.Errorf("no successful runs")
 	}
 
-	sort.Slice(allRuns, func(i, j int) bool {
-		return allRuns[i].GetID() > allRuns[j].GetID()
-	})
+	sort.Slice(allRuns, func(i, j int) bool { return allRuns[i].GetID() > allRuns[j].GetID() })
 
 	for _, run := range allRuns {
-		if run.GetID() == 0 {
-			continue
-		}
-
-		runName := strings.ToLower(run.GetName())
-		if strings.Contains(runName, "codeql") ||
-			strings.Contains(runName, "analyze") ||
-			strings.Contains(runName, "linter") ||
-			strings.Contains(runName, "scorecard") {
-			continue
-		}
-
-		if verbose {
-			log.Printf("      Checking Run ID %d (Name: %s, Event: %s, Branch: %s)...",
-				run.GetID(), run.GetName(), run.GetEvent(), run.GetHeadBranch())
-		}
-
 		analysis, err := fetchAndAnalyzeRun(ctx, client, owner, repo, run.GetID())
-		if err != nil {
-			continue
-		}
-
-		if analysis.DockerImage != "" || analysis.ReleaseVersion != "" {
+		if err == nil && (analysis.DockerImage != "" || analysis.ReleaseVersion != "") {
 			return run.GetID(), run.GetHeadSHA(), run.GetHeadBranch(), analysis, nil
 		}
 	}
-
-	return 0, "", "", nil, fmt.Errorf("no relevant artifacts found in recent runs on main/master")
+	return 0, "", "", nil, fmt.Errorf("no artifacts found")
 }
 
 func fetchAndAnalyzeRun(ctx context.Context, client *github.Client, owner, repo string, runID int64) (*LogAnalysis, error) {
@@ -532,72 +522,41 @@ func fetchAndAnalyzeRun(ctx context.Context, client *github.Client, owner, repo 
 		return nil, err
 	}
 	defer resp.Body.Close()
-
-	logData, err := downloadFile(url.String())
-	if err != nil {
-		return nil, err
-	}
-
+	logData, _ := downloadFile(url.String())
 	return parseLogs(logData)
 }
 
 func downloadSBOMArtifact(ctx context.Context, client *github.Client, owner, repo string, runID int64) ([]byte, error) {
-	opts := &github.ListOptions{PerPage: 100}
-	artifacts, _, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, opts)
+	artifacts, _, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, &github.ListOptions{PerPage: 100})
 	if err != nil {
 		return nil, err
 	}
 
-	var targetArtifact *github.Artifact
-	var availableArtifacts []string
-
+	var target *github.Artifact
 	for _, a := range artifacts.Artifacts {
-		name := strings.ToLower(a.GetName())
-		availableArtifacts = append(availableArtifacts, a.GetName())
-
-		if strings.Contains(name, "sbom") ||
-			strings.Contains(name, "cyclonedx") ||
-			strings.Contains(name, "spdx") ||
-			strings.Contains(name, "results") {
-			targetArtifact = a
+		n := strings.ToLower(a.GetName())
+		if strings.Contains(n, "sbom") || strings.Contains(n, "cyclonedx") {
+			target = a
 			break
 		}
 	}
-
-	if targetArtifact == nil {
-		return nil, fmt.Errorf("no sbom-like artifact found. Available artifacts: [%s]", strings.Join(availableArtifacts, ", "))
+	if target == nil {
+		return nil, fmt.Errorf("no sbom artifact")
 	}
 
-	url, _, err := client.Actions.DownloadArtifact(ctx, owner, repo, targetArtifact.GetID(), 10)
-	if err != nil {
-		return nil, err
-	}
-
-	zipBytes, err := downloadFile(url.String())
-	if err != nil {
-		return nil, err
-	}
-
-	r, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
-	if err != nil {
-		return nil, err
-	}
-
+	url, _, _ := client.Actions.DownloadArtifact(ctx, owner, repo, target.GetID(), 10)
+	zipBytes, _ := downloadFile(url.String())
+	r, _ := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
 	for _, f := range r.File {
 		if strings.HasSuffix(strings.ToLower(f.Name), ".json") {
-			rc, err := f.Open()
-			if err != nil {
-				continue
-			}
+			rc, _ := f.Open()
 			defer rc.Close()
 			return io.ReadAll(rc)
 		}
 	}
-
-	return nil, fmt.Errorf("no .json file found inside artifact zip")
+	return nil, fmt.Errorf("no json")
 }
 
-// LogAnalysis contains metadata extracted from workflow logs
 type LogAnalysis struct {
 	DockerImage    string
 	ReleaseVersion string
@@ -606,8 +565,7 @@ type LogAnalysis struct {
 
 func stripANSI(str string) string {
 	const ansi = "[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))"
-	var re = regexp.MustCompile(ansi)
-	return re.ReplaceAllString(str, "")
+	return regexp.MustCompile(ansi).ReplaceAllString(str, "")
 }
 
 func parseLogs(zipData []byte) (*LogAnalysis, error) {
@@ -615,51 +573,25 @@ func parseLogs(zipData []byte) (*LogAnalysis, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	analysis := &LogAnalysis{}
 	reManifest := regexp.MustCompile(`(?i).*Created\s+manifest\s+list\s+([^\s]+)`)
 	reSBOM := regexp.MustCompile(`(?i)(syft|trivy|cyclonedx|spdx)`)
 
 	for _, f := range r.File {
-		if strings.Contains(f.Name, "Set up job") || strings.Contains(f.Name, "Post Run") ||
-			strings.Contains(f.Name, "Pre Run") || strings.Contains(f.Name, "Complete job") ||
-			strings.Contains(f.Name, "Initialize containers") {
-			continue
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			continue
-		}
-		content, err := io.ReadAll(rc)
+		rc, _ := f.Open()
+		content, _ := io.ReadAll(rc)
 		rc.Close()
-		if err != nil {
-			continue
-		}
-
-		text := string(content)
-		scanner := bufio.NewScanner(strings.NewReader(text))
+		scanner := bufio.NewScanner(strings.NewReader(string(content)))
 		for scanner.Scan() {
-			rawLine := scanner.Text()
-			cleanLine := stripANSI(rawLine)
-			if strings.Contains(cleanLine, "Z ") {
-				parts := strings.SplitN(cleanLine, "Z ", 2)
-				if len(parts) == 2 && len(parts[0]) > 10 && strings.Contains(parts[0], "T") && strings.Contains(parts[0], "-") {
-					cleanLine = parts[1]
-				}
-			}
-			line := strings.TrimSpace(cleanLine)
-
-			if matches := reManifest.FindStringSubmatch(rawLine); len(matches) > 1 {
+			line := stripANSI(scanner.Text())
+			if matches := reManifest.FindStringSubmatch(line); len(matches) > 1 {
 				image := strings.TrimSpace(matches[1])
 				analysis.DockerImage = image
 				parts := strings.Split(image, ":")
 				if len(parts) > 1 {
 					analysis.ReleaseVersion = parts[len(parts)-1]
 				}
-				return analysis, nil
 			}
-
 			if reSBOM.MatchString(line) {
 				analysis.HasSBOM = true
 			}
@@ -668,154 +600,50 @@ func parseLogs(zipData []byte) (*LogAnalysis, error) {
 	return analysis, nil
 }
 
-// -------------------- IMPORTED FUNCTIONS (releasetracker) --------------------
-
 func buildRelease(mapping map[string]string, projectType string) *model.ProjectRelease {
 	release := model.NewProjectRelease()
 	release.Name = getOrDefault(mapping["CompName"], mapping["GitRepoProject"], "unknown")
 	release.Version = getOrDefault(mapping["DockerTag"], mapping["GitTag"], "0.0.0")
 	release.ProjectType = projectType
-
-	release.Basename = mapping["BaseName"]
-	release.BuildID = mapping["BuildId"]
-	release.BuildNum = mapping["BuildNumber"]
-	release.BuildURL = mapping["BuildUrl"]
 	release.DockerRepo = mapping["DockerRepo"]
-	release.DockerSha = mapping["DockerSha"]
 	release.DockerTag = mapping["DockerTag"]
 	release.GitBranch = mapping["GitBranch"]
-	release.GitBranchCreateCommit = mapping["GitBranchCreateCommit"]
-	release.GitBranchParent = mapping["GitBranchParent"]
 	release.GitCommit = mapping["GitCommit"]
-	release.GitCommitAuthors = mapping["GitCommitAuthors"]
-	release.GitCommittersCnt = mapping["GitCommittersCnt"]
-	release.GitContribPercentage = mapping["GitContribPercentage"]
-	release.GitLinesAdded = mapping["GitLinesAdded"]
-	release.GitLinesDeleted = mapping["GitLinesDeleted"]
-	release.GitLinesTotal = mapping["GitLinesTotal"]
 	release.GitOrg = mapping["GitOrg"]
-	release.GitPrevCompCommit = mapping["GitPrevCompCommit"]
-	release.GitRepo = mapping["GitRepo"]
-	release.GitRepoProject = mapping["GitRepoProject"]
-	release.GitSignedOffBy = mapping["GitSignedOffBy"]
-	release.GitTag = mapping["GitTag"]
-	release.GitTotalCommittersCnt = mapping["GitTotalCommittersCnt"]
 	release.GitURL = mapping["GitUrl"]
-	release.GitVerifyCommit = mapping["GitVerifyCommit"] == "Y"
-
-	if buildDate := mapping["BuildDate"]; buildDate != "" {
-		if t, err := time.Parse(time.RFC3339, buildDate); err == nil {
-			release.BuildDate = t
-		}
-	}
-	if gitBranchCreateTimestamp := mapping["GitBranchCreateTimestamp"]; gitBranchCreateTimestamp != "" {
-		if t, err := parseGitDate(gitBranchCreateTimestamp); err == nil {
-			release.GitBranchCreateTimestamp = t
-		}
-	}
-	if gitCommitTimestamp := mapping["GitCommitTimestamp"]; gitCommitTimestamp != "" {
-		if t, err := parseGitDate(gitCommitTimestamp); err == nil {
-			release.GitCommitTimestamp = t
-		}
-	}
-
 	return release
 }
 
 func fetchOpenSSFScorecard(gitURL, commitSha string) (*model.ScorecardAPIResponse, float64, error) {
 	platform, org, repo, err := parseGitURL(gitURL)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to parse git URL: %w", err)
+		return nil, 0, err
 	}
-
-	result, aggregateScore, err := getScorecardData(platform, org, repo, commitSha)
-	if err == nil {
-		return result, aggregateScore, nil
-	}
-
-	if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "404") {
-		if err := triggerScorecardScan(platform, org, repo); err != nil {
-			return nil, 0, fmt.Errorf("failed to trigger scorecard scan: %w", err)
-		}
-
-		time.Sleep(5 * time.Second)
-		result, aggregateScore, err = getScorecardData(platform, org, repo, commitSha)
-		if err == nil {
-			return result, aggregateScore, nil
-		}
-	}
-	return nil, 0, err
-}
-
-func getScorecardData(platform, org, repo, commitSha string) (*model.ScorecardAPIResponse, float64, error) {
 	apiURL := fmt.Sprintf("https://api.securityscorecards.dev/projects/%s/%s/%s", platform, org, repo)
 	resp, err := http.Get(apiURL)
-	if err != nil {
-		return nil, 0, err
+	if err != nil || resp.StatusCode != 200 {
+		return nil, 0, fmt.Errorf("not found")
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, 0, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	var apiResponse model.ScorecardAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
-		return nil, 0, err
-	}
-	apiResponse.Repo.Commit = commitSha
-	return &apiResponse, apiResponse.Score, nil
+	var res model.ScorecardAPIResponse
+	json.NewDecoder(resp.Body).Decode(&res)
+	res.Repo.Commit = commitSha
+	return &res, res.Score, nil
 }
 
-func triggerScorecardScan(platform, org, repo string) error {
-	apiURL := fmt.Sprintf("https://api.securityscorecards.dev/projects/%s/%s/%s", platform, org, repo)
-	resp, err := http.Post(apiURL, "application/json", nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return nil
-}
-
-func parseGitURL(gitURL string) (platform, org, repo string, err error) {
-	gitURL = strings.TrimSuffix(gitURL, ".git")
-	gitURL = strings.TrimPrefix(gitURL, "https://")
-	gitURL = strings.TrimPrefix(gitURL, "http://")
+func parseGitURL(gitURL string) (p, o, r string, err error) {
+	gitURL = strings.TrimPrefix(strings.TrimSuffix(gitURL, ".git"), "https://")
 	parts := strings.Split(gitURL, "/")
 	if len(parts) < 3 {
-		return "", "", "", fmt.Errorf("invalid url")
+		return "", "", "", fmt.Errorf("invalid")
 	}
 	return parts[0], parts[1], parts[2], nil
 }
 
-func parseGitDate(dateStr string) (time.Time, error) {
-	formats := []string{
-		time.RFC3339,
-		time.RFC1123Z,
-		"Mon Jan 2 15:04:05 2006 -0700",
-		"2006-01-02 15:04:05 -0700",
-	}
-	for _, f := range formats {
-		if t, err := time.Parse(f, dateStr); err == nil {
-			return t, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("unable to parse date: %s", dateStr)
-}
-
 func populateContentSha(release *model.ProjectRelease) {
-	if release.ProjectType == "docker" || release.ProjectType == "container" {
-		if release.DockerSha != "" {
-			release.ContentSha = release.DockerSha
-		} else if release.GitCommit != "" {
-			release.ContentSha = release.GitCommit
-		}
+	if (release.ProjectType == "docker" || release.ProjectType == "container") && release.DockerSha != "" {
+		release.ContentSha = release.DockerSha
 	} else {
-		if release.GitCommit != "" {
-			release.ContentSha = release.GitCommit
-		} else if release.DockerSha != "" {
-			release.ContentSha = release.DockerSha
-		}
+		release.ContentSha = release.GitCommit
 	}
 }
 
@@ -827,8 +655,6 @@ func getOrDefault(values ...string) string {
 	}
 	return ""
 }
-
-// -------------------- HELPERS --------------------
 
 func downloadFile(url string) ([]byte, error) {
 	resp, err := http.Get(url)
@@ -848,103 +674,49 @@ func generateSBOMFromInput(ctx context.Context, input string) ([]byte, string, e
 	if err != nil {
 		return nil, "", err
 	}
-
 	dockerSHA := ""
 	if s.Source.Metadata != nil {
 		dockerSHA = s.Source.ID
 	}
-
-	cfg := cyclonedxjson.DefaultEncoderConfig()
-	enc, _ := cyclonedxjson.NewFormatEncoderWithConfig(cfg)
 	var buf bytes.Buffer
-	if err := enc.Encode(&buf, *s); err != nil {
-		return nil, "", err
-	}
+	enc, _ := cyclonedxjson.NewFormatEncoderWithConfig(cyclonedxjson.DefaultEncoderConfig())
+	enc.Encode(&buf, *s)
 	return buf.Bytes(), dockerSHA, nil
 }
 
 func getInstallationToken(appID, pemStr, installID string) (string, error) {
 	block, _ := pem.Decode([]byte(pemStr))
-	if block == nil {
-		return "", fmt.Errorf("failed to parse private key PEM")
-	}
-	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		return "", err
-	}
-
+	key, _ := x509.ParsePKCS1PrivateKey(block.Bytes)
 	claims := jwt.RegisteredClaims{
-		Issuer:    appID,
-		IssuedAt:  jwt.NewNumericDate(time.Now().Add(-60 * time.Second)),
+		Issuer: appID, IssuedAt: jwt.NewNumericDate(time.Now().Add(-60 * time.Second)),
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	signedJWT, _ := token.SignedString(key)
-
 	api := fmt.Sprintf("https://api.github.com/app/installations/%s/access_tokens", installID)
 	req, _ := http.NewRequest("POST", api, nil)
 	req.Header.Set("Authorization", "Bearer "+signedJWT)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 201 {
-		return "", fmt.Errorf("github api error: %s", resp.Status)
-	}
-
+	resp, _ := http.DefaultClient.Do(req)
 	var res struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return "", err
-	}
+	json.NewDecoder(resp.Body).Decode(&res)
 	return res.Token, nil
 }
 
 func gitCloneCheckout(repoURL, commitSHA, dest string) error {
-	cmd := exec.Command("git", "clone", repoURL, dest)
-	if verbose {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("clone failed: %w", err)
-	}
-
-	// Use -b <branch> to checkout the SHA as a new temporary branch
-	checkoutCmd := exec.Command("git", "-C", dest, "checkout", "-b", "relscanner-checkout", commitSHA)
-	if verbose {
-		checkoutCmd.Stdout = os.Stdout
-		checkoutCmd.Stderr = os.Stderr
-	}
-	if err := checkoutCmd.Run(); err != nil {
-		return fmt.Errorf("checkout sha %s failed: %w", commitSHA, err)
-	}
-	return nil
+	exec.Command("git", "clone", repoURL, dest).Run()
+	return exec.Command("git", "-C", dest, "checkout", "-b", "relscanner-checkout", commitSHA).Run()
 }
 
 func postRelease(serverURL string, payload interface{}) error {
-	jsonData, err := json.Marshal(payload)
+	jsonData, _ := json.Marshal(payload)
+	resp, err := http.Post(serverURL+"/api/v1/releases", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("marshal failed: %w", err)
+		return err
 	}
-
-	url := serverURL + "/api/v1/releases"
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("http post failed: %w", err)
+	if resp.StatusCode != 201 {
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
-	}
-
-	log.Printf("      API Response: %s", string(body))
 	return nil
 }

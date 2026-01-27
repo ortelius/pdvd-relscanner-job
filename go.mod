@@ -7,6 +7,7 @@ require (
 	github.com/arangodb/go-driver/v2 v2.1.6
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/golang-jwt/jwt/v5 v5.3.0
+	github.com/google/go-containerregistry v0.20.7
 	github.com/google/go-github/v69 v69.2.0
 	github.com/ortelius/pdvd-backend/v12 v12.0.326
 	github.com/spf13/cobra v1.10.2
@@ -150,7 +151,6 @@ require (
 	github.com/gohugoio/hashstructure v0.6.0 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/go-containerregistry v0.20.7 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/licensecheck v0.3.1 // indirect
 	github.com/google/osv-scanner v1.9.2 // indirect
