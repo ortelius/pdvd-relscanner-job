@@ -4,9 +4,9 @@ WORKDIR /app
 COPY . /app
 
 RUN go mod tidy; \
-    go build -o main .
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o main .
 
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:530fc40b687b95f6c5e8a9b62da03306754da5ef45178e632b7486603bfb7096
+FROM cgr.dev/chainguard/git:latest
 
 WORKDIR /app
 
