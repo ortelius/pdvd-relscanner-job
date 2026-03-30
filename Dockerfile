@@ -1,4 +1,4 @@
-FROM cgr.dev/chainguard/go@sha256:6480fb90d7fe576225a909791f73f5d77592ba53e391cc6ca73a11c3143ae4e7 AS builder
+FROM cgr.dev/chainguard/go@sha256:4ec098b553c8d74d9f01925578660b2bfcdee4ef45e5ab082250cf9675a0e28b AS builder
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 WORKDIR /app
 COPY . /app
