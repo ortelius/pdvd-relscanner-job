@@ -1,6 +1,6 @@
 # Deployment Tracking using GitHub
 
-The Release Scanner (`pdvd-relscanner-job`) is a Kubernetes CronJob that automatically discovers new software releases by monitoring GitHub Actions workflow runs across all repositories connected to your GitHub App installation. It enriches each release with SBOM data, Git provenance, and OpenSSF Scorecard results, then syncs the release records to the Ortelius/DeployHub backend (`pdvd-backend`) via the `/api/v1/releases` API.
+The Release Scanner (`relscanner-job`) is a Kubernetes CronJob that automatically discovers new software releases by monitoring GitHub Actions workflow runs across all repositories connected to your GitHub App installation. It enriches each release with SBOM data, Git provenance, and OpenSSF Scorecard results, then syncs the release records to the Ortelius/DeployHub backend (`ortelius`) via the `/api/v1/releases` API.
 
 This component runs alongside the Ortelius backend and complements the [Deployment Tracking for GKE](./deployment-tracking-gke.md) capability by capturing releases at their source — the CI/CD pipeline — rather than at runtime cluster observation.
 

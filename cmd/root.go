@@ -36,9 +36,9 @@ import (
 	"github.com/arangodb/go-driver/v2/arangodb"
 
 	// Import shared packages from the backend
-	"github.com/ortelius/pdvd-backend/v12/database"
-	"github.com/ortelius/pdvd-backend/v12/model"
-	"github.com/ortelius/pdvd-backend/v12/util"
+	"github.com/ortelius/ortelius/v12/database"
+	"github.com/ortelius/ortelius/v12/model"
+	"github.com/ortelius/ortelius/v12/util"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/oauth2"
