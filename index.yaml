@@ -12,15 +12,4 @@ entries:
     urls:
     - https://github.com/ortelius/pdvd-relscanner-job/releases/download/v12.0.18/pdvd-relscanner-job-12.0.18.tgz
     version: 12.0.18
-  - apiVersion: v2
-    appVersion: 12.0.10
-    created: "2026-01-27T21:30:00.450743661Z"
-    description: Release Scanner Worker
-    digest: bb826e1fdaefb9a392fd25018120c95f071677ab9d2084bf717855f2e851781f
-    icon: https://ortelius.github.io/pdvd-charts/ortelius.svg
-    name: pdvd-relscanner-job
-    type: application
-    urls:
-    - https://github.com/ortelius/pdvd-relscanner-job/releases/download/v12.0.10/pdvd-relscanner-job-12.0.10.tgz
-    version: 12.0.10
 generated: "2026-04-21T19:48:40.163875626Z"
