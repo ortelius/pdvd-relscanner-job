@@ -3,13 +3,14 @@ module relscanner
 go 1.26.1
 
 require (
-	github.com/anchore/syft v1.42.4
-	github.com/arangodb/go-driver/v2 v2.2.0
+	github.com/anchore/syft v1.44.0
+	github.com/arangodb/go-driver/v2 v2.3.0
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-containerregistry v0.21.5
 	github.com/google/go-github/v69 v69.2.0
-	github.com/ortelius/ortelius/v12 v12.0.460
+	github.com/google/go-github/v85 v85.0.0
+	github.com/ortelius/ortelius/v12 v12.0.465
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/oauth2 v0.36.0
 )
@@ -54,7 +55,7 @@ require (
 	github.com/anchore/go-sync v0.1.0 // indirect
 	github.com/anchore/go-version v1.2.2-0.20200701162849-18adb9c92b9b // indirect
 	github.com/anchore/packageurl-go v0.2.0 // indirect
-	github.com/anchore/stereoscope v0.1.22 // indirect
+	github.com/anchore/stereoscope v0.1.23 // indirect
 	github.com/andybalholm/brotli v1.2.1 // indirect
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
 	github.com/aquasecurity/go-npm-version v0.0.2 // indirect
@@ -181,7 +182,7 @@ require (
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
-	github.com/mattn/go-isatty v0.0.21 // indirect
+	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d // indirect
 	github.com/mholt/archives v0.1.5 // indirect
@@ -214,7 +215,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/opencontainers/runtime-spec v1.3.0 // indirect
 	github.com/opencontainers/selinux v1.13.1 // indirect
-	github.com/package-url/packageurl-go v0.1.5 // indirect
+	github.com/package-url/packageurl-go v0.1.6 // indirect
 	github.com/pandatix/go-cvss v0.6.2 // indirect
 	github.com/pborman/indent v1.2.1 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
@@ -271,7 +272,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.1 // indirect
+	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	go4.org v0.0.0-20260112195520-a5071408f32f // indirect
 	golang.org/x/crypto v0.50.0 // indirect
@@ -301,4 +302,4 @@ require (
 	modernc.org/sqlite v1.49.1 // indirect
 )
 
-replace github.com/diskfs/go-diskfs => github.com/diskfs/go-diskfs v1.7.0
+replace github.com/diskfs/go-diskfs => github.com/diskfs/go-diskfs v1.9.1
